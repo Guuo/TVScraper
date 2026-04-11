@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Scraper",
+            "type": "coreclr",
+            "request": "launch",
+            "program": "${workspaceFolder}/vscodeTestApp/bin/Debug/net10.0/vscodeTestApp.dll",
+            "args": "--ticker OANDA:SPX500USD --timeframe 1D --bars 1000",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/vscodeTestApp"
+        }
+    ]
+}
