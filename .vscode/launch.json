@@ -5,10 +5,10 @@
             "name": "Debug Scraper",
             "type": "coreclr",
             "request": "launch",
-            "program": "${workspaceFolder}/vscodeTestApp/bin/Debug/net10.0/vscodeTestApp.dll",
+            "program": "${workspaceFolder}/TVScraper/bin/Debug/net10.0/TVScraper.dll",
             "args": "--ticker OANDA:SPX500USD --timeframe 1D --bars 1000",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/vscodeTestApp"
+            "cwd": "${workspaceFolder}/TVScraper"
         }
     ]
 }
