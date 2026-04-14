@@ -3,6 +3,8 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using TradingViewScraper.Core.Models;
+using System.IO.Pipelines;
+using System.Buffers;
 
 namespace TradingViewScraper.Services;
 
@@ -115,77 +117,155 @@ public class CoreScraper : ITradingViewScraper
 
     private async Task ReceiveMessagesAsync(ClientWebSocket socket, List<OhlcvBar> bars, CancellationToken ct, TaskCompletionSource<bool> dataCompleted)
     {
-        var buffer = new byte[1024 * 16];
-        var streamBuffer = new List<byte>();
-
+        var pipe = new Pipe();
         try
         {
-            while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
-            {
-                var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-                
-                if (result.MessageType == WebSocketMessageType.Close) break;
+            // Run producer and consumer concurrently
+            var writingTask = FillPipeAsync(socket, pipe.Writer, ct);
+            var readingTask = ReadPipeAsync(pipe.Reader, bars, dataCompleted, ct);
 
-                // Append raw bytes to buffer - only decode to string after we have a complete frame
-                for (int i = 0; i < result.Count; i++) streamBuffer.Add(buffer[i]);
-
-                int processedCount = ProcessBuffer(streamBuffer, bars);
-                
-                if (processedCount > 0)
-                {
-                    dataCompleted.TrySetResult(true);
-                }
-            }
+            await Task.WhenAll(writingTask, readingTask);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _logger.LogError(ex, "Error in receive loop"); }
     }
 
-    private int ProcessBuffer(List<byte> buffer, List<OhlcvBar> bars)
+    private async Task FillPipeAsync(ClientWebSocket socket, PipeWriter writer, CancellationToken ct)
     {
-        int messagesProcessedInThisCall = 0;
+        const int minimumBufferSize = 1024 * 16;
+        try
+        {
+            while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
+            {
+                // Get memory directly from the pipe to avoid extra copies
+                Memory<byte> memory = writer.GetMemory(minimumBufferSize);
+                var result = await socket.ReceiveAsync(memory, ct);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    await writer.FlushAsync(ct);
+                    break;
+                }
+
+                writer.Advance(result.Count);
+                var done = await writer.FlushAsync(ct);
+
+                if (done.IsCompleted)
+                    break;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _logger.LogError(ex, "Error in fill pipe"); }
+        finally
+        {
+            await writer.CompleteAsync();
+        }
+    }
+
+    private async Task ReadPipeAsync(PipeReader reader, List<OhlcvBar> bars, TaskCompletionSource<bool> dataCompleted, CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                ReadResult result = await reader.ReadAsync(ct);
+                ReadOnlySequence<byte> buffer = result.Buffer;
+
+                int messagesProcessed = ProcessPipeBuffer(ref buffer, bars);
+
+                if (messagesProcessed > 0)
+                {
+                    dataCompleted.TrySetResult(true);
+                }
+
+                // Advance the reader: 'buffer.Start' is the next byte to read, 
+                // 'buffer.End' is the furthest point we examined.
+                reader.AdvanceTo(buffer.Start, buffer.End);
+
+                if (result.IsCompleted)
+                    break;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { _logger.LogError(ex, "Error in read pipe"); }
+        finally
+        {
+            await reader.CompleteAsync();
+        }
+    }
+
+    /// <summary>Parses framed messages from the pipe buffer.</summary>
+    private int ProcessPipeBuffer(ref ReadOnlySequence<byte> buffer, List<OhlcvBar> bars)
+    {
+        int messagesProcessed = 0;
+        ReadOnlySpan<byte> delimiter = "~m~"u8;
 
         while (true)
         {
-            // Socket.io framing: ~m~length~m~jsonbody
-            int headerStartIndex = FindSequence(buffer, "~m~"u8);
-            if (headerStartIndex == -1) break;
+            // Search for ~m~ framing delimiters
+            long firstPos = FindSequenceInSequence(buffer, delimiter);
+            if (firstPos == -1)
+                break;
 
-            int headerEndIndex = FindSequence(buffer, "~m~"u8, headerStartIndex + 3);
-            if (headerEndIndex == -1) break;
+            long secondPos = FindSequenceInSequence(buffer.Slice(firstPos + 3), delimiter);
+            if (secondPos == -1)
+                break;
+            
+            secondPos += (firstPos + 3);
 
-            var lengthBytes = buffer.GetRange(headerStartIndex + 3, headerEndIndex - (headerStartIndex + 3));
-            string lengthStr = Encoding.UTF8.GetString(lengthBytes.ToArray());
+            // Extract message length from header
+            int lengthSize = (int)(secondPos - (firstPos + 3));
 
-            if (!int.TryParse(lengthStr, out int messageLength))
+            if (lengthSize <= 0)
             {
-                buffer.RemoveRange(0, headerStartIndex + 3);
+                buffer = buffer.Slice(firstPos + 3);
                 continue;
             }
 
-            int totalFrameSize = (headerEndIndex + 3) - headerStartIndex + messageLength;
-            // Wait for more data if frame is incomplete
-            if (buffer.Count < totalFrameSize)
+            var lengthSlice = buffer.Slice(firstPos + 3, lengthSize);
+            string lengthStr = Encoding.UTF8.GetString(lengthSlice.ToArray());
+
+            if (!int.TryParse(lengthStr, out int messageLength))
             {
-                break;
+                buffer = buffer.Slice(firstPos + 3);
+                continue;
             }
 
-            int bodyStartIndex = headerEndIndex + 3;
-            var bodyBytes = buffer.GetRange(bodyStartIndex, messageLength);
-            string jsonMessage = Encoding.UTF8.GetString(bodyBytes.ToArray());
+            // Check if full body has arrived
+            long endOfFrame = secondPos + 3 + messageLength;
 
-            buffer.RemoveRange(0, totalFrameSize);
+            if (buffer.Length < endOfFrame)
+                break;
 
+            var bodySlice = buffer.Slice(secondPos + 3, messageLength);
+            string jsonMessage = Encoding.UTF8.GetString(bodySlice.ToArray());
+
+            // Parse and store extracted bars
             var extractedBars = ParseOhlcvData(jsonMessage);
             if (extractedBars.Any())
             {
                 bars.AddRange(extractedBars);
-                messagesProcessedInThisCall++;
+                messagesProcessed++;
                 _logger.LogDebug("Parsed message: {Msg}", ExtractMessageName(jsonMessage));
             }
+
+            buffer = buffer.Slice(endOfFrame);
         }
 
-        return messagesProcessedInThisCall;
+        return messagesProcessed;
+    }
+
+    private static long FindSequenceInSequence(ReadOnlySequence<byte> buffer, ReadOnlySpan<byte> pattern)
+    {
+        if (pattern.Length == 0) return 0;
+        
+        // For efficiency and simplicity in this refactor, if not single segment, use ToArray search
+        if (buffer.IsSingleSegment)
+        {
+            return buffer.FirstSpan.IndexOf(pattern);
+        }
+
+        return buffer.ToArray().AsSpan().IndexOf(pattern);
     }
 
     private List<OhlcvBar> ParseOhlcvData(string message)
@@ -196,7 +276,6 @@ public class CoreScraper : ITradingViewScraper
             using var doc = JsonDocument.Parse(message);
             var root = doc.RootElement;
 
-            // Guard clauses - validate structure before accessing nested data
             if (!root.TryGetProperty("m", out var method) || method.GetString() != "timescale_update")
                 return bars;
 
@@ -229,25 +308,6 @@ public class CoreScraper : ITradingViewScraper
             _logger.LogWarning(ex, "Failed to parse JSON message");
         }
         return bars;
-    }
-
-    // Searches for a byte sequence in the buffer - used to locate ~m~ frame markers
-private static int FindSequence(List<byte> buffer, ReadOnlySpan<byte> sequence, int startFrom = 0)
-    {
-        for (int i = startFrom; i <= buffer.Count - sequence.Length; i++)
-        {
-            bool match = true;
-            for (int j = 0; j < sequence.Length; j++)
-            {
-                if (buffer[i + j] != sequence[j])
-                {
-                    match = false;
-                    break;
-                }
-            }
-            if (match) return i;
-        }
-        return -1;
     }
 
     private async Task SendMessage(ClientWebSocket socket, string message)
