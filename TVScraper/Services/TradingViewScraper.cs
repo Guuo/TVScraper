@@ -148,6 +148,7 @@ public class CoreScraper : ITradingViewScraper
                 }
 
                 writer.Advance(result.Count);
+                // FlushAsync causes reader.ReadAsync in ReadPipeAsync to return and continue the loop
                 var done = await writer.FlushAsync(ct);
 
                 if (done.IsCompleted)
@@ -202,19 +203,21 @@ public class CoreScraper : ITradingViewScraper
 
         while (true)
         {
+            var reader = new SequenceReader<byte>(buffer);
+
             // Search for ~m~ framing delimiters
-            long firstPos = FindSequenceInSequence(buffer, delimiter);
-            if (firstPos == -1)
+            bool foundDelimiter = reader.TryReadTo(out ReadOnlySequence<byte> segment, delimiter, advancePastDelimiter: true);
+            long firstPos = segment.Length;
+            if (!foundDelimiter)
                 break;
 
-            long secondPos = FindSequenceInSequence(buffer.Slice(firstPos + 3), delimiter);
-            if (secondPos == -1)
+            foundDelimiter = reader.TryReadTo(out segment, delimiter, advancePastDelimiter: true);
+            long secondPos = firstPos + 3 + segment.Length;
+            if (!foundDelimiter)
                 break;
-            
-            secondPos += (firstPos + 3);
 
             // Extract message length from header
-            int lengthSize = (int)(secondPos - (firstPos + 3));
+            int lengthSize = (int)segment.Length;
 
             if (lengthSize <= 0)
             {
@@ -223,12 +226,22 @@ public class CoreScraper : ITradingViewScraper
             }
 
             var lengthSlice = buffer.Slice(firstPos + 3, lengthSize);
-            string lengthStr = Encoding.UTF8.GetString(lengthSlice.ToArray());
-
-            if (!int.TryParse(lengthStr, out int messageLength))
+            int messageLength;
+            if (lengthSlice.IsSingleSegment)
             {
+                if (!int.TryParse(lengthSlice.FirstSpan, out messageLength))
+                {
                 buffer = buffer.Slice(firstPos + 3);
                 continue;
+                }
+            }
+            else
+            {
+                if (!int.TryParse(Encoding.ASCII.GetString(lengthSlice), out messageLength))
+                {
+                buffer = buffer.Slice(firstPos + 3);
+                continue;
+                }
             }
 
             // Check if full body has arrived
@@ -238,7 +251,7 @@ public class CoreScraper : ITradingViewScraper
                 break;
 
             var bodySlice = buffer.Slice(secondPos + 3, messageLength);
-            string jsonMessage = Encoding.UTF8.GetString(bodySlice.ToArray());
+            string jsonMessage = Encoding.UTF8.GetString(bodySlice);
 
             // Parse and store extracted bars
             var extractedBars = ParseOhlcvData(jsonMessage);
