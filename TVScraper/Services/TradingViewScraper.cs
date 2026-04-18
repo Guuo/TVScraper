@@ -195,90 +195,102 @@ public class CoreScraper : ITradingViewScraper
         }
     }
 
-    /// <summary>Parses framed messages from the pipe buffer.</summary>
+    /// <summary>Parses framed messages from the pipe buffer.
+    /// TradingView protocol format: ~m~{length}~m~{body}</summary>
     private int ProcessPipeBuffer(ref ReadOnlySequence<byte> buffer, List<OhlcvBar> bars)
     {
+        ReadOnlySpan<byte> delimiterSpan = "~m~"u8;
         int messagesProcessed = 0;
-        ReadOnlySpan<byte> delimiter = "~m~"u8;
 
         while (true)
         {
+            // TryReadTo advances the reader cursor internally, so each subsequent call
+            // continues from where the previous delimiter was found
             var reader = new SequenceReader<byte>(buffer);
 
-            // Search for ~m~ framing delimiters
-            bool foundDelimiter = reader.TryReadTo(out ReadOnlySequence<byte> segment, delimiter, advancePastDelimiter: true);
-            long firstPos = segment.Length;
-            if (!foundDelimiter)
+            // Search for the first ~m~ delimiter. TryReadTo advances past the
+            // delimiter when advancePastDelimiter=true.
+            if (!reader.TryReadTo(out ReadOnlySequence<byte> _, delimiterSpan, advancePastDelimiter: true))
                 break;
 
-            foundDelimiter = reader.TryReadTo(out segment, delimiter, advancePastDelimiter: true);
-            long secondPos = firstPos + 3 + segment.Length;
-            if (!foundDelimiter)
+            // Search for the second ~m~ delimiter. If not found, the header is
+            // incomplete — wait for more data to arrive rather than rescan.
+            if (!reader.TryReadTo(out ReadOnlySequence<byte> lengthSegment, delimiterSpan, advancePastDelimiter: true))
                 break;
 
-            // Extract message length from header
-            int lengthSize = (int)segment.Length;
-
-            if (lengthSize <= 0)
+            // Parse the length field from digit bytes.
+            if (!TryParseLength(lengthSegment, out int messageLength))
             {
-                buffer = buffer.Slice(firstPos + 3);
+                buffer = buffer.Slice(1 + (int)delimiterSpan.Length);
                 continue;
             }
 
-            var lengthSlice = buffer.Slice(firstPos + 3, lengthSize);
-            int messageLength;
-            if (lengthSlice.IsSingleSegment)
-            {
-                if (!int.TryParse(lengthSlice.FirstSpan, out messageLength))
-                {
-                buffer = buffer.Slice(firstPos + 3);
-                continue;
-                }
-            }
-            else
-            {
-                if (!int.TryParse(Encoding.ASCII.GetString(lengthSlice), out messageLength))
-                {
-                buffer = buffer.Slice(firstPos + 3);
-                continue;
-                }
-            }
-
-            // Check if full body has arrived
-            long endOfFrame = secondPos + 3 + messageLength;
-
+            // reader.Consumed now points to the first byte of the message body
+            // (the reader has advanced past both delimiters and the length text).
+            // Check whether the full body has arrived before attempting extraction.
+            long endOfFrame = reader.Consumed + messageLength;
             if (buffer.Length < endOfFrame)
-                break;
+                break; // Partial body, wait for more data
 
-            var bodySlice = buffer.Slice(secondPos + 3, messageLength);
+            // The body may span multiple segments, but UTF8.GetString handles this via extension methods internally.
+            var bodySlice = buffer.Slice(reader.Consumed, messageLength);
             string jsonMessage = Encoding.UTF8.GetString(bodySlice);
 
-            // Parse and store extracted bars
             var extractedBars = ParseOhlcvData(jsonMessage);
-            if (extractedBars.Any())
+            if (extractedBars.Count > 0)
             {
                 bars.AddRange(extractedBars);
                 messagesProcessed++;
                 _logger.LogDebug("Parsed message: {Msg}", ExtractMessageName(jsonMessage));
             }
 
-            buffer = buffer.Slice(endOfFrame);
+            // Advance the buffer past the complete frame (~m~ + length + ~m~ + body).
+            // reader.Consumed is now positioned after the last byte of the body,
+            // so slicing from it gives us the remaining unconsumed data.
+            buffer = buffer.Slice(reader.Consumed);
         }
 
         return messagesProcessed;
-    }
 
-    private static long FindSequenceInSequence(ReadOnlySequence<byte> buffer, ReadOnlySpan<byte> pattern)
-    {
-        if (pattern.Length == 0) return 0;
-        
-        // For efficiency and simplicity in this refactor, if not single segment, use ToArray search
-        if (buffer.IsSingleSegment)
+        // --- Local function: parse ASCII digit bytes into an int ---
+        static bool TryParseLength(ReadOnlySequence<byte> segment, out int value)
         {
-            return buffer.FirstSpan.IndexOf(pattern);
-        }
+            value = 0;
+            if (segment.IsSingleSegment)
+            {
+                // Common case: the length text fits in a single memory segment.
+                // Parse directly from the span — zero allocations, no encoding step.
+                ReadOnlySpan<byte> span = segment.FirstSpan;
+                for (int i = 0; i < span.Length; i++)
+                {
+                    byte b = span[i];
+                    if (b < '0' || b > '9')
+                        return false;
+                    value = value * 10 + (b - '0');
+                }
+                return true;
+            }
 
-        return buffer.ToArray().AsSpan().IndexOf(pattern);
+            // Uncommon case: the length text spans multiple segments.
+            // Iterate through each segment and parse digits manually to avoid
+            // allocating a string or calling Encoding.ASCII.GetString().
+            foreach (var seg in segment)
+            {
+                ReadOnlySpan<byte> span = seg.Span;
+                for (int i = 0; i < span.Length; i++)
+                {
+                    byte b = span[i];
+                    if (b < '0' || b > '9')
+                        return false;
+                    // Guard against overflow: int.MaxValue is 2,147,483,647.
+                    // If value > 214_748_364 then value*10 would exceed int.MaxValue.
+                    if (value > 214_748_364)
+                        return false;
+                    value = value * 10 + (b - '0');
+                }
+            }
+            return true;
+        }
     }
 
     private List<OhlcvBar> ParseOhlcvData(string message)
